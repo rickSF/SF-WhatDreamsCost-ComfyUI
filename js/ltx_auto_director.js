@@ -432,6 +432,11 @@ function parseNumberedText(text) {
 }
 
 function parsePrompts(text, mode) {
+  // SF 扩展：优先尝试宫格位置标注解析（"左上，中景，4秒，..."格式）
+  if (mode === "auto" || mode === "numbered_text") {
+    const gridParsed = parseGridPositionText(text);
+    if (gridParsed.prompts.length > 0) return gridParsed;
+  }
   if (mode === "auto" || mode === "json") {
     const data = firstJson(text);
     if (data) {
@@ -440,6 +445,117 @@ function parsePrompts(text, mode) {
     }
   }
   return { prompts: parseNumberedText(text), lengths: [] };
+}
+
+// SF 扩展：解析带宫格位置标注+时长标注的单段连续文字
+// 新格式(V2.4)：[风格提示词]。第一个镜头，左上，中景，4秒，[描述]。第二个镜头，右上，近景，3秒，[描述]...
+// 旧格式(V2.3)：[风格提示词]。第一个镜头（对应...）：左上，中景，4秒，[描述]。右上，近景，3秒，[描述]...
+// 注意：风格提示词会保留到第一个镜头的 prompt 前面，不被切掉
+function parseGridPositionText(text) {
+  text = String(text || "").trim();
+  if (!text) return { prompts: [], lengths: [] };
+
+  // 剥离 markdown 围栏
+  if (text.startsWith("```")) text = text.replace(/^```(?:json|JSON)?\s*/, "").replace(/\s*``$/, "");
+  text = text.trim();
+  if (!text) return { prompts: [], lengths: [] };
+
+  const DURATION_RE = /(\d+(?:\.\d+)?)\s*(?:秒|s|S)/;
+  const GRID_WORDS = ["左上","中上","右上","左中","中中","右中","左下","中下","右下"];
+
+  // 提取风格提示词的辅助函数：确保不以句号结尾时补一个句号分隔
+  function joinStylePrefix(prefix, rest) {
+    prefix = String(prefix || "").trim();
+    rest = String(rest || "").trim();
+    if (!prefix) return rest;
+    if (!rest) return prefix;
+    if (/[。.]$/.test(prefix)) return prefix + rest;
+    return prefix + "。" + rest;
+  }
+
+  // 方案1：按"第N个镜头，"切分（新格式 V2.4，每格独立序号）
+  const lensMarkerRe = /第[一二三四五六七八九十\d]+个镜头\s*[,，]\s*/g;
+  const lensMatches = [...text.matchAll(lensMarkerRe)];
+  if (lensMatches.length >= 2) {
+    // 风格提示词 = 第一个"第N个镜头，"之前的全部内容
+    const stylePrefix = text.substring(0, lensMatches[0].index).trim();
+
+    const prompts = [];
+    const lengths = [];
+    for (let idx = 0; idx < lensMatches.length; idx++) {
+      const start = lensMatches[idx][0].length + lensMatches[idx].index;
+      const end = idx + 1 < lensMatches.length ? lensMatches[idx + 1].index : text.length;
+      let segment = text.substring(start, end).trim();
+
+      segment = segment.replace(/[。，.,\s]+$/, "").trim();
+      if (!segment) { prompts.push(""); lengths.push(null); continue; }
+
+      // 先提取时长标记（必须在拼接风格提示词之前）
+      let duration = null;
+      const head = segment.substring(0, Math.min(30, segment.length));
+      const durMatch = DURATION_RE.exec(head);
+      if (durMatch) {
+        duration = parseFloat(durMatch[1]);
+        segment = segment.substring(0, durMatch.index) + segment.substring(durMatch.index + durMatch[0].length);
+        segment = segment.replace(/[,，]{2,}/, "，").trim();
+      }
+
+      // 第一个镜头：时长提取完成后再把风格提示词拼到前面
+      if (idx === 0 && stylePrefix) {
+        segment = joinStylePrefix(stylePrefix, segment);
+      }
+
+      prompts.push(segment);
+      lengths.push(duration);
+    }
+
+    const nonEmpty = prompts.filter(Boolean);
+    if (!nonEmpty.length) return { prompts: [], lengths: [] };
+    return { prompts, lengths };
+  }
+
+  // 方案2：旧格式兼容 - 剥离"第N个镜头（对应...）："前缀后按宫格位置标注切分
+  let lensMarker = /第[一二三四五六七八九十\d]+个镜头(?:[\uff08(][^\uff09)]*[\uff09)]|[(][^)]*[)])?\s*[\uff1a:：]\s*/;
+  let lensMatchIdx = text.search(lensMarker);
+  let stylePrefixV2 = "";  // 旧格式下保存风格提示词
+  if (lensMatchIdx >= 0) {
+    stylePrefixV2 = text.substring(0, lensMatchIdx).trim();  // 保存风格提示词
+    text = text.substring(text.match(lensMarker)[0].length);
+  }
+
+  const gridRe = new RegExp("(?:" + GRID_WORDS.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join("|") + ")\\s*[,\\uff0c:：]\\s*", "g");
+
+  const matches = [...text.matchAll(gridRe)];
+  if (!matches.length) return { prompts: [], lengths: [] };
+
+  const prompts = [];
+  const lengths = [];
+  for (let idx = 0; idx < matches.length; idx++) {
+    let start = matches[idx][0].length + matches[idx].index;
+    let end = idx + 1 < matches.length ? matches[idx + 1].index : text.length;
+    let segment = text.substring(start, end).trim();
+
+    segment = segment.replace(/[\u3002.]+\s*$/, "").trim();
+    if (!segment) { prompts.push(""); lengths.push(null); continue; }
+
+    // 先提取时长标记（必须在拼接风格提示词之前）
+    let duration = null;
+    const durMatch = DURATION_RE.exec(segment.substring(0, 30));
+    if (durMatch) {
+      duration = parseFloat(durMatch[1]);
+      segment = segment.substring(0, durMatch.index) + segment.substring(durMatch.index + durMatch[0].length);
+      segment = segment.replace(/[,\\uFF0c]{2,}/, "\uFF0C").trim();
+    }
+
+    // 第一个格子：时长提取完成后再把风格提示词拼到前面
+    if (idx === 0 && stylePrefixV2) {
+      segment = joinStylePrefix(stylePrefixV2, segment);
+    }
+
+    if (segment) { prompts.push(segment); lengths.push(duration); }
+  }
+
+  return { prompts, lengths };
 }
 
 function parseNumberList(text) {

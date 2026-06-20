@@ -1133,7 +1133,131 @@ function prMappingToList(data) {
   return null;
 }
 
+// SF 扩展：解析带宫格位置标注+时长标注的单段连续文字
+// 新格式(V2.4)：[风格提示词]。第一个镜头，左上，中景，4秒，[描述]。第二个镜头，右上，近景，3秒，[描述]...
+// 旧格式(V2.3)：[风格提示词]。第一个镜头（对应...）：左上，中景，4秒，[描述]。右上，近景，3秒，[描述]...
+// 返回 { prompts: [...], lengths: [帧数或null,...] }
+// 注意：风格提示词会保留到第一个镜头的 prompt 前面，不被切掉
+function prParseGridPositionText(text) {
+  text = String(text || "").trim();
+  if (!text) return { prompts: [], lengths: [] };
+
+  // 剥离 markdown 围栏
+  if (text.startsWith("```")) text = text.replace(/^```(?:json|JSON)?\s*/, "").replace(/\s*``$/, "");
+  text = text.trim();
+  if (!text) return { prompts: [], lengths: [] };
+
+  const DURATION_RE = /(\d+(?:\.\d+)?)\s*(?:秒|s|S)/;
+  const GRID_WORDS = ["左上", "中上", "右上", "左中", "中中", "右中", "左下", "中下", "右下"];
+
+  // 提取风格提示词的辅助函数：确保不以句号结尾时补一个句号分隔
+  function joinStylePrefix(prefix, rest) {
+    prefix = String(prefix || "").trim();
+    rest = String(rest || "").trim();
+    if (!prefix) return rest;
+    if (!rest) return prefix;
+    // 如果 prefix 已以句号结尾，直接拼接；否则补一个中文句号
+    if (/[。.]$/.test(prefix)) return prefix + rest;
+    return prefix + "。" + rest;
+  }
+
+  // 方案1：按"第N个镜头，"切分（新格式 V2.4，每格独立序号）
+  const lensMarkerRe = /第[一二三四五六七八九十\d]+个镜头\s*[,，]\s*/g;
+  const lensMatches = [...text.matchAll(lensMarkerRe)];
+  if (lensMatches.length >= 2) {
+    // 风格提示词 = 第一个"第N个镜头，"之前的全部内容
+    const stylePrefix = text.substring(0, lensMatches[0].index).trim();
+
+    const prompts = [];
+    const lengths = [];
+    for (let idx = 0; idx < lensMatches.length; idx++) {
+      const start = lensMatches[idx][0].length + lensMatches[idx].index;
+      const end = idx + 1 < lensMatches.length ? lensMatches[idx + 1].index : text.length;
+      let segment = text.substring(start, end).trim();
+
+      // 去掉末尾句号/逗号
+      segment = segment.replace(/[。，.,\s]+$/, "").trim();
+      if (!segment) { prompts.push(""); lengths.push(null); continue; }
+
+      // 先提取时长标记 "N秒，"（必须在拼接风格提示词之前，否则风格提示词会把时长推到30字符之外）
+      let duration = null;
+      const head = segment.substring(0, Math.min(30, segment.length));
+      const durMatch = DURATION_RE.exec(head);
+      if (durMatch) {
+        duration = parseFloat(durMatch[1]);
+        segment = segment.substring(0, durMatch.index) + segment.substring(durMatch.index + durMatch[0].length);
+        segment = segment.replace(/[,，]{2,}/, "，").trim();
+      }
+
+      // 第一个镜头：时长提取完成后再把风格提示词拼到前面
+      if (idx === 0 && stylePrefix) {
+        segment = joinStylePrefix(stylePrefix, segment);
+      }
+
+      prompts.push(segment);
+      lengths.push(duration);
+    }
+
+    const nonEmpty = prompts.filter(Boolean);
+    if (!nonEmpty.length) return { prompts: [], lengths: [] };
+    return { prompts, lengths };
+  }
+
+  // 方案2：旧格式兼容 - 剥离"第N个镜头（对应...）："前缀后按宫格位置标注切分
+  const oldLensMarker = /第[一二三四五六七八九十\d]+个镜头(?:[\uff08(][^\uff09)]*[\uff09)]|[(][^)]*[)])?\s*[\uff1a:：]\s*/;
+  const oldLensIdx = text.search(oldLensMarker);
+  let stylePrefixV2 = "";  // 旧格式下保存风格提示词
+  if (oldLensIdx >= 0) {
+    stylePrefixV2 = text.substring(0, oldLensIdx).trim();  // 保存风格提示词
+    const m = text.match(oldLensMarker);
+    if (m) text = text.substring(oldLensIdx + m[0].length);
+  }
+
+  const gridRe = new RegExp("(?:" + GRID_WORDS.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|") + ")\\s*[,\\uff0c:：]\\s*", "g");
+  const matches = [...text.matchAll(gridRe)];
+  if (!matches.length) return { prompts: [], lengths: [] };
+
+  const prompts = [];
+  const lengths = [];
+  for (let idx = 0; idx < matches.length; idx++) {
+    const start = matches[idx][0].length + matches[idx].index;
+    const end = idx + 1 < matches.length ? matches[idx + 1].index : text.length;
+    let segment = text.substring(start, end).trim();
+
+    segment = segment.replace(/[\u3002.]+\s*$/, "").trim();
+    if (!segment) { prompts.push(""); lengths.push(null); continue; }
+
+    // 先提取时长标记（必须在拼接风格提示词之前）
+    let duration = null;
+    const head = segment.substring(0, Math.min(30, segment.length));
+    const durMatch = DURATION_RE.exec(head);
+    if (durMatch) {
+      duration = parseFloat(durMatch[1]);
+      segment = segment.substring(0, durMatch.index) + segment.substring(durMatch.index + durMatch[0].length);
+      segment = segment.replace(/[,，]{2,}/, "，").trim();
+    }
+
+    // 第一个格子：时长提取完成后再把风格提示词拼到前面
+    if (idx === 0 && stylePrefixV2) {
+      segment = joinStylePrefix(stylePrefixV2, segment);
+    }
+
+    prompts.push(segment);
+    lengths.push(duration);
+  }
+
+  const nonEmpty = prompts.filter(Boolean);
+  if (!nonEmpty.length) return { prompts: [], lengths: [] };
+  return { prompts, lengths };
+}
+
 function prParsePrompts(text) {
+  // SF 扩展：优先尝试宫格位置标注解析（"左上，中景，4秒，..."格式）
+  const gridParsed = prParseGridPositionText(text);
+  if (gridParsed.prompts.length > 1) {
+    return gridParsed.prompts;
+  }
+
   const data = prFirstJson(text);
   if (data) {
     let items = data;
@@ -1213,8 +1337,45 @@ function prEvenLengths(totalFrames, count) {
   return lengths.map((v) => Math.max(1, v));
 }
 
-function prResolveSegmentLengths(node, count, ignoreManual = false) {
+function prResolveSegmentLengths(node, count, ignoreManual = false, promptText = "") {
   const totalFrames = Math.max(count, Math.round(Number(prGetWidgetValue(node, "duration_frames", 120)) || 120));
+  const frameRate = Math.max(1, Math.round(Number(prGetWidgetValue(node, "frame_rate", 24)) || 24));
+
+  // SF 扩展：优先从提示词中的"N秒"标注提取时长，转成帧数
+  if (promptText) {
+    const gridParsed = prParseGridPositionText(promptText);
+    if (gridParsed.lengths && gridParsed.lengths.length >= count) {
+      const secs = gridParsed.lengths.slice(0, count);
+      // 仅当至少有一个非零时长才使用
+      if (secs.some((v) => v && v > 0)) {
+        const lengths = secs.map((v) => (v && v > 0 ? Math.max(1, Math.round(v * frameRate)) : 0));
+        // 补齐缺失项
+        for (let i = 0; i < lengths.length; i++) if (!lengths[i]) lengths[i] = 0;
+        // 把零时长按平均分配剩余帧数
+        const usedFrames = lengths.reduce((acc, v) => acc + v, 0);
+        const remainFrames = Math.max(0, totalFrames - usedFrames);
+        const zeroCount = lengths.filter((v) => v === 0).length;
+        if (zeroCount > 0 && remainFrames > 0) {
+          const base = Math.floor(remainFrames / zeroCount);
+          let extra = remainFrames - base * zeroCount;
+          for (let i = 0; i < lengths.length; i++) {
+            if (lengths[i] === 0) {
+              lengths[i] = Math.max(1, base + (extra > 0 ? 1 : 0));
+              if (extra > 0) extra -= 1;
+            }
+          }
+        }
+        // 修正总和与 totalFrames 的差值（截断或补齐）
+        let sum = lengths.reduce((acc, v) => acc + v, 0);
+        if (sum !== totalFrames) {
+          const diff = totalFrames - sum;
+          lengths[lengths.length - 1] = Math.max(1, lengths[lengths.length - 1] + diff);
+        }
+        return lengths;
+      }
+    }
+  }
+
   const manual = ignoreManual ? [] : prParseNumberList(prGetWidgetValue(node, "segment_lengths", ""));
   if (manual.length) {
     const lengths = manual.slice(0, count).map((v) => Math.max(1, Math.round(v)));
@@ -2563,8 +2724,8 @@ class TimelineEditor {
 
     const maxFromGrid = source ? Math.min(SIX_GRID_MAX_SEGMENTS, source.cols * source.rows) : SIX_GRID_MAX_SEGMENTS;
     const count = Math.max(1, maxFromGrid);
-    const lengths = prResolveSegmentLengths(this.node, count, ignoreManualLengths);
     const promptText = this.getCurrentLLMText();
+    const lengths = prResolveSegmentLengths(this.node, count, ignoreManualLengths, promptText);
     const prompts = prParsePrompts(promptText);
 
     await this.ensureSixGridPreviewImage(source, sourceKey);
