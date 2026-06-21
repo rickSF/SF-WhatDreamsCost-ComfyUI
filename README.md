@@ -1,6 +1,8 @@
 # SF-WhatDreamsCost-ComfyUI
 
 基于 [WhatDreamsCost/WhatDreamsCost-ComfyUI](https://github.com/WhatDreamsCost/WhatDreamsCost-ComfyUI) 二次开发。
+基于https://github.com/yg496/CS-WhatDreamsCost-ComfyUI二次开发
+感谢原代码作者Jonathan Watkins以及work-fisher和尺素呵等一众大佬
 
 SF 版本核心增强：**自动识别万象分镜脚本视频提示词中的宫格位置标注和时长标注，实现音画时长同步、视频和谐连贯**。
 
