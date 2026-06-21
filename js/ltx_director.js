@@ -1147,6 +1147,9 @@ function prParseGridPositionText(text) {
   text = text.trim();
   if (!text) return { prompts: [], lengths: [] };
 
+  // SF 扩展：剥离"正面词："前缀（用户从 ComfyUI 正面词输入框粘贴时可能带上）
+  text = text.replace(/^[\s]*正面词[:：][\s]*/, "");
+
   const DURATION_RE = /(\d+(?:\.\d+)?)\s*(?:秒|s|S)/;
   const GRID_WORDS = ["左上", "中上", "右上", "左中", "中中", "右中", "左下", "中下", "右下"];
 
